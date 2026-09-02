@@ -1,0 +1,63 @@
+# PrimeVulVulnRun - RUN A of the ground-truth arm: every VULNERABLE version,
+# one fresh anchor pool, every model at kvcomm_margin_threshold in {0.1,0.3,0.5}.
+#
+#   python experiments/sweep.py --spec experiments/sweeps/primevul_vuln.yaml \
+#       --runner experiments/run_primevul.py --no-analysis
+#
+# Preview the cells first:
+#   ... --dry-run
+#
+# 3 models x 1 mode x 3 thresholds x 1 run = 9 cells, 100 samples each.
+#
+# --- Why the two arms are separate runs ---
+# A vulnerable function and its patched twin differ by a handful of tokens. If
+# both entered the same online anchor pool, one version could become an anchor
+# before the other was evaluated, manufacturing cross-context similarity that
+# the deployed setting would never produce. So all vulnerable versions run here
+# (RUN A), all patched versions run in primevul_patched.yaml (RUN B), and the
+# two are matched offline by pair_id. Both files list the samples in the same
+# deterministic order, so the two runs see structurally matched sequences.
+#
+# --- Why one run per threshold ---
+# kvcomm_margin_threshold is applied *during* the pipeline: it selects which
+# forward pass becomes the emitted output and it mutates the online anchor pool,
+# so sample N's threshold decision changes sample N+1's available anchors. A
+# captured run cannot be faithfully re-thresholded; each threshold is its own
+# run in a fresh subprocess.
+#
+# --- Single run, no seeds ---
+# `repetitions: 1` with no `seeds` key => a single derived seed (42) purely to
+# pin determinism. Decoding is greedy, so the seed is inert.
+sweep_name: PrimeVulVulnRun
+models:
+  - Qwen/Qwen2.5-3B-Instruct
+  - Qwen/Qwen2.5-Coder-7B-Instruct
+  - meta-llama/Llama-3.2-3B-Instruct
+modes: [kvcomm]
+repetitions: 1
+tasks_path: datasets/primevul/tasks_vulnerable.jsonl
+limit: null
+# Match the NIST arm: the validator emits all ten rule blocks.
+max_tokens: 6000
+
+kv_params:
+  kv_threshold: [0.1, 0.3, 0.5]
+  kv_max_anchor_num: [20]
+  kv_window_size: [5]
+
+# The provider never uses KV reuse: the PrimeVul function's KV is always donated
+# by an exact forward pass, so the code under review is byte-identical across
+# thresholds and any validator divergence is attributable to the margin.
+generator_dense: true
+
+# Validator behaviour (on-hit baseline path):
+#   anchor HIT  -> KV-reuse pass + ONE dense baseline pass (the reference)
+#   anchor MISS -> ONE dense pass only (which IS the dense verdict; reuse could
+#                  not have fired, so R == D for that sample by construction)
+# Every sample therefore yields both a dense and a deployed-reuse verdict at
+# ~1.65 generations per sample instead of 2.
+dense_reference_always: false
+noise_floor_baseline: false
+
+cell_timeout_minutes: 600
+output_root: results

@@ -1,0 +1,46 @@
+# FinalRun — the sweep the AISec paper reports.
+#
+# Launch once and walk away; every report is generated automatically when the
+# last cell finishes:
+#
+#   python experiments/sweep.py --spec experiments/sweeps/final_run.yaml
+#
+# Preview first:
+#   python experiments/sweep.py --spec experiments/sweeps/final_run.yaml --dry-run
+#
+# Resume after an interruption (finished cells are skipped):
+#   python experiments/sweep.py --spec experiments/sweeps/final_run.yaml
+#
+# Regenerate reports without re-running any GPU work:
+#   python experiments/sweep.py --spec experiments/sweeps/final_run.yaml --analysis-only
+#
+# 3 models x 1 mode x 1 kv-point x 3 repetitions = 9 cells.
+sweep_name: FinalRun
+models:
+  - Qwen/Qwen2.5-3B-Instruct
+  - Qwen/Qwen2.5-Coder-7B-Instruct
+  - meta-llama/Llama-3.2-3B-Instruct
+modes: [kvcomm]
+repetitions: 3
+seeds: [42, 43, 44]
+tasks_path: datasets/secure_code/coding_tasks.jsonl
+limit: null
+max_tokens: 6000
+kv_params:
+  kv_threshold: [0.3]
+  kv_max_anchor_num: [20]
+  kv_window_size: [5]
+
+# Record a second measurement-only dense baseline on every anchor hit. Diffing
+# the two dense reports measures the dense-vs-dense noise floor on exactly the
+# cases fidelity is reported over, which is what licenses attributing observed
+# divergence to KV reuse instead of assuming it. Costs roughly one extra dense
+# generation per hit (~30-40% more wall-clock); the timeout below accounts for
+# it. Set false only if GPU time runs short — the paper's causal claim is much
+# weaker without it.
+noise_floor_baseline: true
+
+# 6000-token generations x 100 tasks x 2 agents, plus on-hit dense baselines and
+# the second noise-floor baseline. Generous headroom per cell.
+cell_timeout_minutes: 2200
+output_root: results

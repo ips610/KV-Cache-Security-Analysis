@@ -1,0 +1,1137 @@
+diff --git a/KVCOMM/agents/__init__.py b/KVCOMM/agents/__init__.py
+index ce6eca0..a0dbca4 100644
+--- a/KVCOMM/agents/__init__.py
++++ b/KVCOMM/agents/__init__.py
+@@ -2,6 +2,10 @@ from KVCOMM.agents.analyze_agent import AnalyzeAgent
+ from KVCOMM.agents.code_writing import CodeWriting
+ from KVCOMM.agents.math_solver import MathSolver
+ from KVCOMM.agents.copy_machine import CopyMachine
++from KVCOMM.agents.code_generator import CodeGenerator
++from KVCOMM.agents.code_provider import CodeProvider
++from KVCOMM.agents.security_validator import SecurityValidator
++from KVCOMM.agents.cwe_validator import CweValidator
+ from KVCOMM.agents.final_decision import FinalRefer,FinalDirect,FinalWriteCode,FinalMajorVote
+ from KVCOMM.agents.agent_registry import AgentRegistry
+ 
+@@ -9,6 +13,10 @@ __all__ =  ['AnalyzeAgent',
+             'CodeWriting',
+             'MathSolver',
+             'CopyMachine',
++            'CodeGenerator',
++            'CodeProvider',
++            'SecurityValidator',
++            'CweValidator',
+             'FinalRefer',
+             'FinalDirect',
+             'FinalWriteCode',
+diff --git a/KVCOMM/llm/gpt_chat.py b/KVCOMM/llm/gpt_chat.py
+index a368379..0d645a2 100644
+--- a/KVCOMM/llm/gpt_chat.py
++++ b/KVCOMM/llm/gpt_chat.py
+@@ -11,6 +11,7 @@ Key concepts:
+ - Anchor: A remembered KV delta used to adjust prefix/payload caches.
+ """
+ from typing import List, Union, Optional, Dict, Any, Tuple
++import hashlib
+ import json
+ from tenacity import retry, wait_random_exponential, stop_after_attempt
+ from dotenv import load_dotenv
+@@ -34,10 +35,23 @@ from KVCOMM.llm.llm_registry import LLMRegistry
+ from KVCOMM.llm.config import KVCommConfig
+ 
+ from KVCOMM.llm.token_ops import *
+-from KVCOMM.llm.kvcomm_engine import KVCOMMEngine, _RequestState
++from KVCOMM.llm.kvcomm_engine import BareCodeKVPackage, KVCOMMEngine, _RequestState
+ from KVCOMM.utils.metrics import GenerationResult
+ from KVCOMM.utils.log import logger
+ 
++
++# Device the shared model is loaded onto. Defaults to the single CUDA device
++# every recorded result was produced on; KVCOMM_DEVICE=cpu makes an off-GPU
++# smoke test possible without touching any other code path.
++_DEVICE = os.getenv("KVCOMM_DEVICE", "cuda:0")
++
++
++def _cuda_sync() -> None:
++    """Barrier before a timing read; a no-op off CUDA so the harness can run on CPU."""
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++
++
+ MINE_API_KEYS = os.getenv('API_KEY')
+ 
+ 
+@@ -98,7 +112,7 @@ class _TTFTTracer(StoppingCriteria):
+     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
+         if self.ttft is None and input_ids.shape[-1] > self.prompt_length:
+             if torch.cuda.is_available():
+-                torch.cuda.synchronize()
++                _cuda_sync()
+             self.ttft = perf_counter() - self.start_time
+         return False
+ 
+@@ -538,6 +552,233 @@ class LLMChat(LLM):
+         """Return per-request state used by the KV engine."""
+         return self.kv_engine.get_request_state(request_uid)
+ 
++    def _tokenizer_identity(self) -> Tuple[str, str]:
++        return (
++            str(getattr(self.tokenizer, "name_or_path", "") or ""),
++            type(self.tokenizer).__name__,
++        )
++
++    @staticmethod
++    def _bare_code_package_seal(package: BareCodeKVPackage) -> Tuple[Any, ...]:
++        ids = package.input_ids.detach().to("cpu", dtype=torch.long).contiguous()
++        ids_digest = hashlib.sha256(ids.numpy().tobytes()).hexdigest()
++        return (
++            package.code_sha256,
++            ids_digest,
++            package.token_count,
++            package.model_name,
++            package.tokenizer_name,
++            package.tokenizer_class,
++        )
++
++    def validate_bare_code_package(self, package: BareCodeKVPackage) -> None:
++        """Fail closed if an Agent 1 package cannot be consumed by this model."""
++        if not isinstance(package, BareCodeKVPackage):
++            raise RuntimeError("PrimeVul handoff is missing a BareCodeKVPackage.")
++        tokenizer_name, tokenizer_class = self._tokenizer_identity()
++        if package.model_name != self.model_name:
++            raise RuntimeError(
++                f"PrimeVul package model mismatch: {package.model_name!r} != {self.model_name!r}."
++            )
++        if (package.tokenizer_name, package.tokenizer_class) != (
++            tokenizer_name, tokenizer_class
++        ):
++            raise RuntimeError("PrimeVul package tokenizer identity mismatch.")
++        if package.input_ids.ndim != 2 or package.input_ids.shape[0] != 1:
++            raise RuntimeError("PrimeVul package input_ids must have shape [1, tokens].")
++        if not torch.equal(package.attention_mask, torch.ones_like(package.input_ids)):
++            raise RuntimeError("PrimeVul package attention mask is invalid.")
++        if package.token_count != int(package.input_ids.shape[-1]):
++            raise RuntimeError("PrimeVul package token count does not match its token IDs.")
++        cache_len = int(package.kv_cache.get_seq_length())
++        if cache_len != package.token_count:
++            raise RuntimeError(
++                f"PrimeVul package cache length {cache_len} != token count "
++                f"{package.token_count}."
++            )
++
++    def get_bare_code_package(
++        self, *, request_uid: str, source_agent_id: str
++    ) -> BareCodeKVPackage:
++        state = self.get_request_state(request_uid)
++        package = state.bare_code_packages.get(str(source_agent_id))
++        if package is None:
++            raise RuntimeError(
++                f"PrimeVul request {request_uid!r} has no opaque package from "
++                f"Agent {source_agent_id}."
++            )
++        self.validate_bare_code_package(package)
++        expected_seal = state.bare_code_package_seals.get(str(source_agent_id))
++        if expected_seal is None or expected_seal != self._bare_code_package_seal(package):
++            raise RuntimeError("PrimeVul opaque package integrity/hash mismatch.")
++        return package
++
++    async def encode_bare_code_kv(
++        self,
++        code: str,
++        *,
++        request_uid: str,
++        source_agent_id: str,
++        output_dir: Optional[Union[str, Path]] = None,
++        agent_name: Optional[str] = None,
++        agent_role: Optional[str] = None,
++    ) -> BareCodeKVPackage:
++        """Dense-prefill exactly ``code`` and store an opaque PrimeVul handoff.
++
++        This is intentionally not a chat/generation path: no prompt builder,
++        role, chat template, special token, anchor, or gate method is invoked.
++        """
++        if not isinstance(code, str) or not code:
++            raise ValueError("PrimeVul Agent 1 requires a non-empty code string.")
++        state = self.get_request_state(request_uid)
++        if str(source_agent_id) in state.bare_code_packages:
++            raise RuntimeError("PrimeVul Agent 1 package already exists for this request.")
++
++        encoded = self.tokenizer(
++            code,
++            add_special_tokens=False,
++            return_tensors="pt",
++        )
++        input_ids = encoded["input_ids"].to(self.model.device)
++        attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids)).to(
++            self.model.device
++        )
++        if input_ids.shape[-1] == 0:
++            raise ValueError("PrimeVul code tokenized to zero tokens.")
++
++        started = perf_counter()
++        with torch.no_grad():
++            outputs = self.model(
++                input_ids=input_ids,
++                attention_mask=attention_mask,
++                use_cache=True,
++                return_dict=True,
++            )
++        if torch.cuda.is_available():
++            _cuda_sync()
++        elapsed = max(0.0, perf_counter() - started)
++        cache = outputs.past_key_values
++        if not isinstance(cache, DynamicCache):
++            cache = DynamicCache.from_legacy_cache(cache)
++        # Older KVCOMM code also consults this compatibility counter; the
++        # canonical length remains ``get_seq_length()``.
++        try:
++            cache._seen_tokens = int(input_ids.shape[-1])
++        except Exception:
++            pass
++
++        tokenizer_name, tokenizer_class = self._tokenizer_identity()
++        package = BareCodeKVPackage(
++            input_ids=input_ids,
++            attention_mask=attention_mask,
++            kv_cache=cache,
++            token_count=int(input_ids.shape[-1]),
++            code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest(),
++            model_name=self.model_name,
++            tokenizer_name=tokenizer_name,
++            tokenizer_class=tokenizer_class,
++        )
++        self.validate_bare_code_package(package)
++        state.bare_code_packages[str(source_agent_id)] = package
++        state.bare_code_package_seals[str(source_agent_id)] = self._bare_code_package_seal(
++            package
++        )
++        _append_latency_record(output_dir, {
++            "timestamp": time.time(),
++            "mode": "dense_code_encode",
++            "ttft": elapsed,
++            "generation_ttft": None,
++            "generation_total_latency": elapsed,
++            "input_tokens": package.token_count,
++            "output_tokens": 0,
++            "request_uid": request_uid,
++            "agent_id": str(source_agent_id),
++            "agent_name": agent_name,
++            "agent_role": agent_role,
++            "code_sha256": package.code_sha256,
++            "measure_only": False,
++        })
++        return package
++
++    def assert_dense_code_matches_package(
++        self,
++        *,
++        request_uid: str,
++        source_agent_id: str,
++        code: str,
++    ) -> BareCodeKVPackage:
++        """Validate the dense-only plaintext payload against Agent 1's package."""
++        package = self.get_bare_code_package(
++            request_uid=request_uid, source_agent_id=source_agent_id
++        )
++        digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
++        if digest != package.code_sha256:
++            raise RuntimeError("PrimeVul dense payload hash does not match Agent 1's package.")
++        code_ids = self.tokenizer(
++            code, add_special_tokens=False, return_tensors="pt"
++        )["input_ids"].to(package.input_ids.device)
++        if not torch.equal(code_ids, package.input_ids):
++            raise RuntimeError("PrimeVul dense payload token IDs do not match Agent 1's IDs.")
++        return package
++
++    def select_bare_code_mode(
++        self,
++        *,
++        request_uid: str,
++        source_agent_id: str,
++        audit_key: str,
++    ) -> str:
++        """Orchestration-owned gate for PrimeVul Agent 2.
++
++        Agent 1 never calls this method.  It compares Agent 1's bare-code KV
++        with the validator's existing code-placeholder anchors and records the
++        same decision state used by ``set_anchor``.
++        """
++        package = self.get_bare_code_package(
++            request_uid=request_uid, source_agent_id=source_agent_id
++        )
++        state = self.get_request_state(request_uid)
++        ph_id = f"agent_{source_agent_id}_current"
++        anchors = state.anchors.setdefault(ph_id, {})
++        lengths = state.anchor_len_dict.setdefault(ph_id, {})
++        infos = state.anchor_info_dict.setdefault(ph_id, {})
++        anchor_keys = list(anchors.keys())
++        anchor_lengths = [lengths.get(key, [0, 0]) for key in anchor_keys]
++        activated = list(infos.values())
++        dense, activated = self.kv_engine.predict_as_anchor(
++            package.kv_cache,
++            anchor_kv_cache_list=list(anchors.values()),
++            anchor_len_list=anchor_lengths,
++            anchor_activated_list=activated,
++        )
++        state.anchor_dict.setdefault(ph_id, {})[audit_key] = dense
++        global_info = state.global_anchor_info.setdefault(ph_id, {})
++        if dense:
++            infos[audit_key] = 0
++            global_info[audit_key] = [0, package.token_count]
++            return "dense_prefill"
++
++        required = {
++            f"{self.node_id}_ph_key_delta",
++            f"{self.node_id}_ph_value_delta",
++            f"{self.node_id}_pf_key_delta",
++            f"{self.node_id}_pf_value_delta",
++        }
++        eligible = [
++            anchors[key]
++            for key, length in zip(anchor_keys, anchor_lengths)
++            if length[0] >= package.token_count
++        ]
++        if not eligible or any(not required.issubset(entry) for entry in eligible):
++            raise RuntimeError(
++                "PrimeVul gate selected KV reuse without a genuine compatible anchor delta."
++            )
++        for index, key in enumerate(list(infos.keys())):
++            if index < len(activated):
++                infos[key] = activated[index]
++                global_info.setdefault(key, [0, 0])[0] = activated[index]
++        return "kv_reuse"
++
+     def _ensure_agent_memory(self, agent_id: str) -> Dict[str, Any]:
+         """Return the shared memory slot for a given agent id."""
+         return LLMChat._shared_kv_cache_memory.setdefault(agent_id, {})
+@@ -747,7 +988,7 @@ class LLMChat(LLM):
+         if test_time:
+             for _ in range(10):
+                 if _ == 5:
+-                    torch.cuda.synchronize()
++                    _cuda_sync()
+                     start_time = perf_counter()
+                 output = self.model.generate(
+                     **token_ids,
+@@ -756,7 +997,7 @@ class LLMChat(LLM):
+                     return_dict_in_generate=True,
+                     return_legacy_cache=False,
+                 )
+-            torch.cuda.synchronize()
++            _cuda_sync()
+             end_time = perf_counter()
+             logger.opt(colors=True).info(
+                 f"<cyan>Latency for computing the input kv-cache of {message}: {(end_time - start_time) / 5:.3f} seconds</cyan>"
+@@ -832,11 +1073,18 @@ class LLMChat(LLM):
+         agent_name: Optional[str] = None,
+         agent_role: Optional[str] = None,
+         output_dir: Optional[Union[str, Path]] = None,
++        forced_response_text: Optional[str] = None,
+         **kwargs: Any,
+     ) -> GenerationResult:
+-        """Generate a response using the requested strategy with sensible fallbacks."""
++        """Generate a response using the requested strategy with sensible fallbacks.
++
++        ``forced_response_text`` is for an agent that *supplies* a fixed artifact
++        rather than generating one; it implies dense prefill (see ``agen_kvcomm``).
++        """
+         latency_target = output_dir or kwargs.get("output_dir")
+-        if preferred_mode == "dense_prefill":
++        if forced_response_text is not None:
++            mode = "dense_prefill"
++        elif preferred_mode == "dense_prefill":
+             mode = "dense_prefill"
+         elif self.has_active_anchor(request_uid, message):
+             mode = "dense_prefill"
+@@ -855,6 +1103,7 @@ class LLMChat(LLM):
+                 agent_name=agent_name,
+                 agent_role=agent_role,
+                 output_dir=latency_target,
++                forced_response_text=forced_response_text,
+                 **kwargs,
+             )
+         return await self.generate_with_kv_reuse(
+@@ -883,6 +1132,26 @@ class LLMChat(LLM):
+             except Exception as exc:
+                 raise RuntimeError("Thread task failed") from exc
+ 
++    def sampling_kwargs(self, temperature):
++        """Return ``do_sample``/``temperature`` for this agent's generation.
++
++        Decoding is greedy by default, which makes the seed inert and every run
++        byte-identical. Sampling is opt-in per agent **role** via the environment:
++
++            KVCOMM_SAMPLE_ROLES="Security Validator"   # comma-separated
++            KVCOMM_SAMPLE_TEMPERATURE=0.7
++
++        Restricting sampling to the validator is deliberate: the generator stays
++        greedy, so the code under review is byte-identical across every arm,
++        repetition and threshold, while the validator's repetitions genuinely
++        differ and the dense-vs-dense noise floor becomes measurable.
++        """
++        roles = [r.strip() for r in os.environ.get("KVCOMM_SAMPLE_ROLES", "").split(",") if r.strip()]
++        if not roles or getattr(self, "role", None) not in roles:
++            return {"do_sample": False, "temperature": temperature}
++        sample_temp = float(os.environ.get("KVCOMM_SAMPLE_TEMPERATURE", 0.7))
++        return {"do_sample": True, "temperature": sample_temp, "top_p": 1.0}
++
+     def set_id(self, node_id: str, role: str):
+         """Bind the chat instance to a graph node id and role."""
+         self.node_id = node_id
+@@ -931,12 +1200,20 @@ class LLMChat(LLM):
+         with LLMChat._model_lock:
+             if LLMChat._shared_model is None:
+                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+-                LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
+-                    self.model_name,
++                load_kwargs = dict(
+                     torch_dtype=torch.float16 if 'llama' in self.model_name else torch.float32,
+                     low_cpu_mem_usage=True,
+-                    device_map="cuda:0",
+-                    trust_remote_code=True
++                    trust_remote_code=True,
++                )
++                # cuda:0 unless overridden. The override exists so the pipeline
++                # can be smoke-tested off-GPU with a small model before a
++                # multi-hour run; every recorded result is cuda:0, and env.json
++                # carries the device that produced it. On CPU device_map is
++                # omitted rather than set, so accelerate is not required.
++                if _DEVICE != "cpu":
++                    load_kwargs["device_map"] = _DEVICE
++                LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
++                    self.model_name, **load_kwargs
+                 )
+                 logger.info("Model {} loaded and shared across instances.", self.model_name)
+             if LLMChat._shared_kv_cache_memory is None:
+@@ -1042,8 +1319,7 @@ class LLMChat(LLM):
+                 safe_prompt_text,
+             )
+             generation_kwargs = {
+-                "do_sample": False,
+-                "temperature": temperature,
++                **self.sampling_kwargs(temperature),
+                 "max_new_tokens": max_tokens,
+                 "return_dict_in_generate": True,
+                 "return_legacy_cache": False,
+@@ -1055,7 +1331,7 @@ class LLMChat(LLM):
+             outputs = self.model.generate(**inputs, **generation_kwargs)
+             if ttft_tracer.ttft is None:
+                 if torch.cuda.is_available():
+-                    torch.cuda.synchronize()
++                    _cuda_sync()
+                 ttft_value = 0.0
+             else:
+                 ttft_value = ttft_tracer.ttft
+@@ -1101,9 +1377,15 @@ class LLMChat(LLM):
+         agent_name: Optional[str] = None,
+         agent_role: Optional[str] = None,
+         output_dir: Optional[Union[str, Path]] = None,
++        measure_only: bool = False,
++        forced_response_text: Optional[str] = None,
+         **kwargs
+     ) -> GenerationResult:
+-        """Generate with dense prefix prefill and optional anchor update."""
++        """Generate with dense prefix prefill and optional anchor update.
++
++        ``measure_only=True`` is the on-hit dense baseline: time the dense prefill
++        without writing to the anchor pool (see ``agen_kvcomm``).
++        """
+         return await self.agen_kvcomm(
+             messages=messages,
+             max_tokens=max_tokens,
+@@ -1115,7 +1397,9 @@ class LLMChat(LLM):
+             agent_id=agent_id,
+             agent_name=agent_name,
+             agent_role=agent_role,
+-            output_dir=output_dir
++            output_dir=output_dir,
++            measure_only=measure_only,
++            forced_response_text=forced_response_text,
+         )
+ 
+     @retry(wait=wait_random_exponential(max=1000), stop=stop_after_attempt(1))
+@@ -1156,6 +1440,7 @@ class LLMChat(LLM):
+             agent_name=agent_name,
+             agent_role=agent_role,
+             output_dir=output_dir,
++            strict_anchor_reuse=bool(kwargs.get("strict_anchor_reuse", False)),
+         )
+ 
+     async def agen_kvcomm(
+@@ -1171,6 +1456,9 @@ class LLMChat(LLM):
+         agent_name: Optional[str] = None,
+         agent_role: Optional[str] = None,
+         output_dir: Optional[Union[str, Path]] = None,
++        measure_only: bool = False,
++        forced_response_text: Optional[str] = None,
++        strict_anchor_reuse: bool = False,
+     ) -> GenerationResult:
+         """Core KV-aware generation entry.
+ 
+@@ -1178,6 +1466,20 @@ class LLMChat(LLM):
+         placeholder caches, then runs generation either with:
+         - dense_prefill: compute fresh prefix KV and optionally set anchors
+         - kv_reuse: reuse existing prefix KV and inject as past_key_values
++
++        ``measure_only`` runs the generation purely for timing (the on-hit dense
++        baseline): it skips ``set_anchor`` so the global anchor pool is untouched
++        and later tasks' natural hit rate is unaffected. The latency record is
++        tagged ``measure_only`` so reporting excludes it from natural-run stats.
++
++        ``forced_response_text`` teacher-forces the response instead of decoding
++        it: the text's token ids are appended to the prompt and the model takes a
++        single step. Everything downstream is unchanged, because
++        ``sequences[:, prefix_token_length:-1]`` is then exactly those tokens and
++        ``full_kv_cache.slice_(start=prefix_token_length)`` is exactly their KV.
++        That is how an agent which *supplies* a fixed artifact rather than
++        generating one still donates a genuine, exactly-computed KV segment to
++        its successors. Dense prefill only.
+         """
+         if max_tokens is None:
+             max_tokens = self.DEFAULT_MAX_TOKENS
+@@ -1187,6 +1489,10 @@ class LLMChat(LLM):
+             raise ValueError("request_uid must be provided for agen_kvcomm.")
+         state = self.kv_engine.resolve_request_state(request_uid)
+         preprocess_start = perf_counter() if mode == "kv_reuse" else None
++        # Observability sentinels — overwritten in the relevant mode branch.
++        anchor_making_latency: Optional[float] = None
++        anchor_hit: Optional[bool] = None
++        offset_fallback: Optional[bool] = None
+ 
+         if isinstance(messages, List):
+             message = messages[0]
+@@ -1216,8 +1522,10 @@ class LLMChat(LLM):
+         for idx, ((ph_id, (start, end)), pf_kv, pf_token_id) in enumerate(
+             zip(placeholder_entries, prefix_kv_list[1:], prefix_token_ids[1:])
+         ):
+-            ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
+-            real_len = ph_cache._seen_tokens - drop_num
++            ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(
++                ph_id, message, request_uid=request_uid
++            )
++            real_len = int(ph_cache.get_seq_length()) - drop_num
+             templ_len = end - start
+             delta_len = real_len - templ_len
+             meta.append(
+@@ -1258,6 +1566,14 @@ class LLMChat(LLM):
+                 for m in meta
+             ]
+             results = list(self._map_in_pool(self.kv_engine.update_kv_cache_segment, tasks, timeout=30))
++            _obs_vals = list(state.anchor_obs.values())
++            anchor_hit = any(o.get("anchor_hit") for o in _obs_vals) if _obs_vals else False
++            offset_fallback = any(o.get("offset_fallback") for o in _obs_vals) if _obs_vals else False
++            if strict_anchor_reuse and (anchor_hit is not True or offset_fallback is not False):
++                raise RuntimeError(
++                    "Strict PrimeVul KV reuse requires a genuine anchor delta; "
++                    "offset fallback is forbidden."
++                )
+         else:
+             raise ValueError(f"Unsupported mode '{mode}' for agen_kvcomm.")
+ 
+@@ -1268,7 +1584,7 @@ class LLMChat(LLM):
+             start = m["start"] + m["offset_before"]
+             placeholder_indices[m["ph_id"]] = (
+                 start,
+-                start + m["ph_cache"]._seen_tokens - m["drop_num"],
++                start + int(m["ph_cache"].get_seq_length()) - m["drop_num"],
+             )
+ 
+         seg_cache_list = [r[1] for r in results_sorted]
+@@ -1291,10 +1607,34 @@ class LLMChat(LLM):
+                 torch.arange(input_length).unsqueeze(0).to(self.model.device)
+             )
+ 
++        forced_ids = None
++        if forced_response_text is not None:
++            if mode != "dense_prefill":
++                raise ValueError(
++                    "forced_response_text requires mode='dense_prefill': a supplied "
++                    "artifact's KV must be computed exactly, never approximated."
++                )
++            forced_ids = self.tokenizer(
++                forced_response_text, return_tensors="pt", add_special_tokens=False
++            )["input_ids"].to(self.model.device)
++            if forced_ids.shape[-1] == 0:
++                raise ValueError("forced_response_text tokenized to zero tokens.")
++            merged_prefix_token_ids["input_ids"] = torch.cat(
++                [merged_prefix_token_ids["input_ids"], forced_ids], dim=-1
++            )
++            merged_prefix_token_ids["attention_mask"] = torch.ones_like(
++                merged_prefix_token_ids["input_ids"]
++            )
++            input_length = int(merged_prefix_token_ids["input_ids"].shape[-1])
++            if "position_ids" in merged_prefix_token_ids:
++                merged_prefix_token_ids["position_ids"] = (
++                    torch.arange(input_length).unsqueeze(0).to(self.model.device)
++                )
++
+         generation_kwargs: Dict[str, Any] = {
+-            "max_length": max_tokens + prefix_token_length,
+-            "do_sample": False,
+-            "temperature": temperature,
++            "max_length": (input_length + 1) if forced_ids is not None
++                          else (max_tokens + prefix_token_length),
++            **self.sampling_kwargs(temperature),
+             "return_legacy_cache": False,
+             "return_dict_in_generate": True,
+         }
+@@ -1309,10 +1649,12 @@ class LLMChat(LLM):
+         preprocess_latency = 0.0
+         if preprocess_start is not None:
+             preprocess_latency = max(0.0, perf_counter() - preprocess_start)
++        gen_start = perf_counter()
+         outputs = self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
++        if torch.cuda.is_available():
++            _cuda_sync()
++        generation_total_latency = max(0.0, perf_counter() - gen_start)
+         if ttft_tracer.ttft is None:
+-            if torch.cuda.is_available():
+-                torch.cuda.synchronize()
+             generation_ttft = 0.0
+         else:
+             generation_ttft = ttft_tracer.ttft
+@@ -1331,17 +1673,22 @@ class LLMChat(LLM):
+             base_placeholder_cache, base_prefix_cache = base_cache.split_cache_by_placeholders(
+                 placeholder_indices
+             )
+-            self.kv_engine.set_anchor(
+-                request_uid,
+-                message,
+-                ph_id_list,
+-                real_placeholder_cache,
+-                real_prefix_cache,
+-                base_placeholder_cache,
+-                base_prefix_cache,
+-                max_anchor_num=max_anchor_num,
+-                window_length=window_length,
+-            )
++            # measure_only: skip the global anchor-pool write so the on-hit dense
++            # baseline does not seed anchors and bias later tasks' natural hits.
++            if not measure_only:
++                _anchor_make_start = perf_counter()
++                self.kv_engine.set_anchor(
++                    request_uid,
++                    message,
++                    ph_id_list,
++                    real_placeholder_cache,
++                    real_prefix_cache,
++                    base_placeholder_cache,
++                    base_prefix_cache,
++                    max_anchor_num=max_anchor_num,
++                    window_length=window_length,
++                )
++                anchor_making_latency = max(0.0, perf_counter() - _anchor_make_start)
+ 
+         response_kv_cache = full_kv_cache.slice_(start=prefix_token_length)
+         response_kv_cache = self.kv_engine.apply_rotary_pos_emb(
+@@ -1409,6 +1756,10 @@ class LLMChat(LLM):
+             outputs.sequences[0, prefix_token_length:],
+             skip_special_tokens=True,
+         )
++        if forced_ids is not None:
++            # The response IS the supplied artifact; drop the single extra token
++            # `generate` had to emit and return the text byte-for-byte.
++            response_message = forced_response_text
+         prompt_preview = self.tokenizer.decode(
+             merged_prefix_token_ids["input_ids"][0]
+         )
+@@ -1428,13 +1779,37 @@ class LLMChat(LLM):
+             safe_response_message,
+             mode=mode,
+         )
++        input_tokens = int(input_length)
++        output_tokens = int(outputs.sequences.shape[-1]) - prefix_token_length
++
++        logger.opt(colors=True).info(
++            "<green>[GEN:{mode}]</green> {}",
++            json.dumps({
++                "agent_id": self.node_id,
++                "role": self.role,
++                "mode": mode,
++                "ttft": float(ttft_value),
++                "dense_prefill_or_gen_ttft": float(generation_ttft),
++                "preprocess_latency": float(preprocess_latency),
++                "generation_total_latency": float(generation_total_latency),
++                "input_tokens": input_tokens,
++                "output_tokens": output_tokens,
++                "anchor_hit": anchor_hit,
++                "offset_fallback": offset_fallback,
++                "anchor_making_latency": anchor_making_latency,
++            }, ensure_ascii=False),
++            mode=mode,
++        )
+ 
+         metadata: Dict[str, Any] = {
+             "placeholder_ids": ph_id_list,
++            "generation_ttft": generation_ttft,
++            "generation_total_latency": generation_total_latency,
++            "anchor_hit": anchor_hit,
++            "offset_fallback": offset_fallback,
+         }
+         if preprocess_start is not None:
+             metadata["preprocess_latency"] = preprocess_latency
+-            metadata["generation_ttft"] = generation_ttft
+         if request_uid:
+             metadata["request_uid"] = request_uid
+         if agent_id:
+@@ -1448,13 +1823,20 @@ class LLMChat(LLM):
+             "mode": mode,
+             "ttft": float(ttft_value),
+             "generation_ttft": float(generation_ttft),
++            "generation_total_latency": float(generation_total_latency),
+             "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
++            "anchor_making_latency": anchor_making_latency,
++            "anchor_hit": anchor_hit,
++            "offset_fallback": offset_fallback,
++            "input_tokens": input_tokens,
++            "output_tokens": output_tokens,
+             "request_uid": request_uid,
+             "agent_id": agent_id,
+             "agent_name": agent_name,
+             "agent_role": agent_role,
+             "message": str(message) if message is not None else None,
+             "placeholder_ids": ph_id_list,
++            "measure_only": measure_only,
+         }
+         _append_latency_record(output_dir, latency_record)
+         return GenerationResult(
+@@ -1524,8 +1906,10 @@ class LLMChat(LLM):
+         for idx, ((ph_id, (start, end)), pf_kv, pf_token_id) in enumerate(
+             zip(placeholder_entries, prefix_kv_list[1:], prefix_token_ids[1:])
+         ):
+-            ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
+-            real_len = ph_cache._seen_tokens - drop_num
++            ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(
++                ph_id, message, request_uid=request_uid
++            )
++            real_len = int(ph_cache.get_seq_length()) - drop_num
+             templ_len = end - start
+             delta_len = real_len - templ_len
+             meta.append(
+@@ -1576,7 +1960,7 @@ class LLMChat(LLM):
+             start = m["start"] + m["offset_before"]
+             placeholder_indices[m["ph_id"]] = (
+                 start,
+-                start + m["ph_cache"]._seen_tokens - m["drop_num"],
++                start + int(m["ph_cache"].get_seq_length()) - m["drop_num"],
+             )
+ 
+         seg_cache_list = [r[1] for r in results_sorted]
+@@ -1602,8 +1986,7 @@ class LLMChat(LLM):
+         generation_kwargs: Dict[str, Any] = {
+             "max_length": max_tokens + prefix_token_length,
+             "min_new_tokens": min_tokens,
+-            "do_sample": False,
+-            "temperature": temperature,
++            **self.sampling_kwargs(temperature),
+             "return_legacy_cache": False,
+             "return_dict_in_generate": True,
+         }
+@@ -1614,14 +1997,14 @@ class LLMChat(LLM):
+ 
+         preprocess_latency = 0.0
+         if preprocess_start is not None:
+-            torch.cuda.synchronize()
++            _cuda_sync()
+             preprocess_latency = max(0.0, perf_counter() - preprocess_start)
+-        torch.cuda.synchronize()
++        _cuda_sync()
+         ttft_tracer = _TTFTTracer(prefix_token_length)
+         generation_kwargs["stopping_criteria"] = StoppingCriteriaList([ttft_tracer])
+         ttft_tracer.reset(prefix_token_length)
+         outputs = self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
+-        torch.cuda.synchronize()
++        _cuda_sync()
+         if mode == "kv_reuse" and preprocess_start is not None:
+             kvcomm_end_to_end_latency = perf_counter() - ttft_tracer.start_time
+             kvcomm_ttft_value = ttft_tracer.ttft + preprocess_latency
+@@ -1631,12 +2014,12 @@ class LLMChat(LLM):
+         full_kv_cache = outputs.past_key_values
+ 
+         generation_kwargs.pop("past_key_values", None)
+-        torch.cuda.synchronize()
++        _cuda_sync()
+         ttft_tracer = _TTFTTracer(prefix_token_length)
+         generation_kwargs["stopping_criteria"] = StoppingCriteriaList([ttft_tracer])
+         ttft_tracer.reset(prefix_token_length)
+         _ = self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
+-        torch.cuda.synchronize()
++        _cuda_sync()
+         dense_end_to_end_latency = perf_counter() - ttft_tracer.start_time
+         dense_prefill_ttft = ttft_tracer.ttft
+         logger.opt(colors=True).info(
+diff --git a/KVCOMM/llm/kvcomm_engine.py b/KVCOMM/llm/kvcomm_engine.py
+index 4678620..09cd314 100644
+--- a/KVCOMM/llm/kvcomm_engine.py
++++ b/KVCOMM/llm/kvcomm_engine.py
+@@ -9,7 +9,9 @@ prefill.
+ from __future__ import annotations
+ 
+ import copy
++import json
+ import threading
++from dataclasses import dataclass
+ from collections.abc import MutableMapping
+ from collections.abc import Sequence
+ from time import perf_counter
+@@ -21,9 +23,57 @@ from transformers.cache_utils import DynamicCache
+ from KVCOMM.llm.token_ops import concat
+ from KVCOMM.utils.log import logger
+ 
++
++def _cuda_sync() -> None:
++    """Barrier before a timing read; a no-op off CUDA so the harness can run on CPU."""
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++
++
+ _MISSING = object()
+ _DELETED = object()
+ 
++
++@dataclass(slots=True)
++class BareCodeKVPackage:
++    """Request-scoped, tensor-bearing handoff from PrimeVul Agent 1.
++
++    The package deliberately contains no source text.  It is stored only on a
++    request state and is therefore discarded by ``finalize_request`` rather
++    than committed to the process-wide anchor dictionaries.
++    """
++
++    input_ids: torch.Tensor
++    attention_mask: torch.Tensor
++    kv_cache: DynamicCache
++    token_count: int
++    code_sha256: str
++    model_name: str
++    tokenizer_name: str
++    tokenizer_class: str
++
++    def audit_metadata(self) -> Dict[str, Any]:
++        """Return the persistable subset; tensors and token ids stay private."""
++        return {
++            "token_count": self.token_count,
++            "code_sha256": self.code_sha256,
++            "model_name": self.model_name,
++            "tokenizer_name": self.tokenizer_name,
++            "tokenizer_class": self.tokenizer_class,
++        }
++
++
++def _source_agent_from_placeholder(ph_id: str) -> Optional[str]:
++    """Parse the producing agent id from a placeholder name (pure string op).
++
++    ``'agent_0_current'`` -> ``'0'``; ``'condition_2_history'`` -> ``'2'``;
++    ``'user_question'`` -> ``None``.
++    """
++    parts = ph_id.split("_")
++    if len(parts) >= 2 and parts[0] in ("agent", "condition"):
++        return parts[1]
++    return None
++
+ def _is_layered_cache(cache: DynamicCache) -> bool:
+     """Return True if the cache uses the newer `layers` structure."""
+     return hasattr(cache, "layers")
+@@ -662,6 +712,11 @@ class _RequestState:
+         self.weight_dict = _ScopedDict(weight_dict)
+         self.anchors = _ScopedDict(anchors)
+         self.global_anchor_info = _ScopedDict(global_anchor_info_dict)
++        # Ephemeral per-generation observability scratch-pad (not committed).
++        self.anchor_obs: Dict[str, Dict[str, Any]] = {}
++        # PrimeVul Agent 1 handoffs are request-scoped and never committed.
++        self.bare_code_packages: Dict[str, BareCodeKVPackage] = {}
++        self.bare_code_package_seals: Dict[str, Tuple[Any, ...]] = {}
+ 
+     def commit(self) -> None:
+         self.anchor_dict.commit()
+@@ -696,11 +751,14 @@ class KVCOMMEngine:
+ 
+     @staticmethod
+     def _stack_cache_tensors(cache: DynamicCache) -> Tuple[torch.Tensor, torch.Tensor]:
+-        return torch.stack(cache.key_cache), torch.stack(cache.value_cache)
++        stacked = _stack_cache_tensors(cache)
++        if stacked is None:
++            raise RuntimeError("KV cache does not contain stackable layer tensors.")
++        return stacked
+ 
+     @staticmethod
+     def _placeholder_length(cache: DynamicCache) -> int:
+-        return cache.key_cache[0].shape[-2]
++        return _safe_seq_len(cache)
+ 
+     def _rotate_segment_caches(self, segment_meta: Dict[str, Any]) -> Tuple[DynamicCache, DynamicCache]:
+         rotated_placeholder = self.apply_rotary_pos_emb(
+@@ -744,6 +802,11 @@ class KVCOMMEngine:
+             state = cls._request_states.pop(request_uid, None)
+             if state is None:
+                 return
++            # Never let request-scoped raw-code KV survive in the deferred
++            # commit queue when other concurrent requests are still active.
++            state.bare_code_packages.clear()
++            state.bare_code_package_seals.clear()
++            state.anchor_obs.clear()
+             cls._staged_commits.append(state)
+             cls._active_requests.discard(request_uid)
+             if not cls._active_requests:
+@@ -876,9 +939,12 @@ class KVCOMMEngine:
+         temperature: int = 1,
+     ) -> Tuple[DynamicCache, DynamicCache]:
+         """Blend base caches with anchor deltas weighted by similarity."""
+-        placeholder_len = int(base_placeholder_cache._seen_tokens)
++        _obs_state = self.resolve_request_state(request_uid)
++
++        placeholder_len = _safe_seq_len(base_placeholder_cache)
+         if placeholder_len <= 0:
+             self._log_warning("real_placeholder_kv_cache has no tokens, skip updating.")
++            _obs_state.anchor_obs[ph_id] = {"anchor_hit": False, "offset_fallback": True}
+             return base_placeholder_cache, base_prefix_cache
+ 
+         real_key_embedding, real_value_embedding = self._stack_cache_tensors(base_placeholder_cache)
+@@ -891,6 +957,7 @@ class KVCOMMEngine:
+             message=message,
+             signature=anchor_signature,
+         )
++        reused_from_cache = cache_entry is not None
+ 
+         if cache_entry is None:
+             anchor_index = self._select_anchor_indices(anchor_list, placeholder_len)
+@@ -899,6 +966,7 @@ class KVCOMMEngine:
+                     self._log_warning(
+                         f"No anchors cover placeholder {ph_id} for Agent {self.llm.node_id} ({self.llm.role})."
+                     )
++                _obs_state.anchor_obs[ph_id] = {"anchor_hit": False, "offset_fallback": True}
+                 return base_placeholder_cache.copy(), base_prefix_cache.copy()
+ 
+             cache_entry = self._compute_anchor_weight_entry(
+@@ -910,6 +978,7 @@ class KVCOMMEngine:
+                 float(temperature),
+             )
+             if cache_entry is None:
++                _obs_state.anchor_obs[ph_id] = {"anchor_hit": False, "offset_fallback": True}
+                 return base_placeholder_cache.copy(), base_prefix_cache.copy()
+             cache_entry["anchor_signature"] = anchor_signature
+             cache_entry["placeholder_len"] = placeholder_len
+@@ -917,8 +986,24 @@ class KVCOMMEngine:
+         else:
+             anchor_index = cache_entry["anchor_index"]
+             if not anchor_index:
++                _obs_state.anchor_obs[ph_id] = {"anchor_hit": False, "offset_fallback": True}
+                 return base_placeholder_cache.copy(), base_prefix_cache.copy()
+ 
++        _obs_state.anchor_obs[ph_id] = {"anchor_hit": True, "offset_fallback": False}
++        logger.opt(colors=True).info(
++            "<cyan>[ANCHOR USED]</cyan> {}",
++            json.dumps({
++                "used_by_agent_id": self.llm.node_id,
++                "used_by_role": self.llm.role,
++                "placeholder": ph_id,
++                "source_agent_id": _source_agent_from_placeholder(ph_id),
++                "num_anchors_used": len(anchor_index),
++                "anchor_index": list(anchor_index),
++                "reused_from_cache": reused_from_cache,
++                "message": str(message),
++            }, ensure_ascii=False),
++        )
++
+         weights_key_for_prefix = cache_entry["weights_key_for_prefix"]
+         weights_value_for_prefix = cache_entry["weights_value_for_prefix"]
+         weights_key_for_placeholder = cache_entry["weights_key_for_placeholder"]
+@@ -958,33 +1043,33 @@ class KVCOMMEngine:
+             weights_value_for_placeholder * placeholder_value_delta_stack
+         ).sum(0)
+ 
+-        new_placeholder_cache = type(base_placeholder_cache)()
++        new_placeholder_cache = base_placeholder_cache.copy()
+         updated_placeholder_key = (
+             real_key_embedding + layer_total_delta_key_for_placeholder.to(real_key_embedding.dtype)
+         )
+         updated_placeholder_key[0] = real_key_embedding[0]
+-        new_placeholder_cache.key_cache = list(updated_placeholder_key)
+ 
+         updated_placeholder_value = (
+             real_value_embedding + layer_total_value_delta_for_placeholder.to(real_value_embedding.dtype)
+         )
+         updated_placeholder_value[0] = real_value_embedding[0]
+-        new_placeholder_cache.value_cache = list(updated_placeholder_value)
+-        new_placeholder_cache._seen_tokens = base_placeholder_cache._seen_tokens
++        _assign_stack_to_cache(
++            new_placeholder_cache, updated_placeholder_key, updated_placeholder_value
++        )
++        _set_seen_tokens(new_placeholder_cache, _safe_seq_len(base_placeholder_cache))
+ 
+         base_prefix_key, base_prefix_value = self._stack_cache_tensors(base_prefix_cache)
+ 
+-        new_prefix_cache = type(base_prefix_cache)()
++        new_prefix_cache = base_prefix_cache.copy()
+         updated_prefix_key = base_prefix_key + layer_total_delta_key_for_prefix.to(base_prefix_key.dtype)
+         updated_prefix_key[0] = base_prefix_key[0]
+-        new_prefix_cache.key_cache = list(updated_prefix_key)
+ 
+         updated_prefix_value = (
+             base_prefix_value + layer_total_value_delta_for_prefix.to(base_prefix_value.dtype)
+         )
+         updated_prefix_value[0] = base_prefix_value[0]
+-        new_prefix_cache.value_cache = list(updated_prefix_value)
+-        new_prefix_cache._seen_tokens = base_prefix_cache._seen_tokens
++        _assign_stack_to_cache(new_prefix_cache, updated_prefix_key, updated_prefix_value)
++        _set_seen_tokens(new_prefix_cache, _safe_seq_len(base_prefix_cache))
+ 
+         return new_placeholder_cache, new_prefix_cache
+ 
+@@ -1002,9 +1087,9 @@ class KVCOMMEngine:
+             return True, anchor_activated_list
+ 
+         if test_time:
+-            torch.cuda.synchronize()
++            _cuda_sync()
+             start_time = perf_counter()
+-        k = candidate_kv_cache.value_cache[0].shape[-2]
++        k = _safe_seq_len(candidate_kv_cache)
+         anchor_available = [i for i, (j, _accum_j) in enumerate(anchor_len_list) if j >= k]
+ 
+         if len(anchor_len_list) != len(anchor_kv_cache_list):
+@@ -1015,7 +1100,10 @@ class KVCOMMEngine:
+             return True, anchor_activated_list
+ 
+         if len(anchor_available) > 1:
+-            candidate_value_embedding = torch.stack(candidate_kv_cache.value_cache)[..., :k, :]
++            _candidate_key, candidate_value_embedding = self._stack_cache_tensors(
++                candidate_kv_cache
++            )
++            candidate_value_embedding = candidate_value_embedding[..., :k, :]
+             anchor_value_embedding = torch.stack(
+                 [anchor_kv_cache_list[i]["ph_value_embedding"][..., :k, :] for i in anchor_available]
+             )
+@@ -1029,7 +1117,7 @@ class KVCOMMEngine:
+                     "skip activating anchors.</yellow>"
+                 )
+                 if test_time:
+-                    torch.cuda.synchronize()
++                    _cuda_sync()
+                     end_time = perf_counter()
+                     logger.opt(colors=True).debug(
+                         f"<cyan>Latency for Anchor prediction: {end_time - start_time} s</cyan>"
+@@ -1050,7 +1138,7 @@ class KVCOMMEngine:
+                     continue
+                 anchor_activated_list[anchor_available[i]] += 1
+             if test_time:
+-                torch.cuda.synchronize()
++                _cuda_sync()
+                 end_time = perf_counter()
+                 logger.opt(colors=True).debug(
+                     f"<cyan>Latency for Anchor prediction: {end_time - start_time} s</cyan>"
+@@ -1150,6 +1238,17 @@ class KVCOMMEngine:
+ 
+             if message not in anchor_store[ph_id_list[i]]:
+                 anchor_store[ph_id_list[i]][message] = entry
++                logger.opt(colors=True).info(
++                    "<yellow>[ANCHOR CREATED]</yellow> {}",
++                    json.dumps({
++                        "created_by_agent_id": self.llm.node_id,
++                        "created_by_role": self.llm.role,
++                        "placeholder": ph_id_list[i],
++                        "source_agent_id": _source_agent_from_placeholder(ph_id_list[i]),
++                        "placeholder_len": placeholder_len,
++                        "message": str(message),
++                    }, ensure_ascii=False),
++                )
+                 info_bucket = state.anchor_info_dict.setdefault(ph_id_list[i], {})
+                 info_bucket[message] = 0
+ 
+@@ -1200,27 +1299,28 @@ class KVCOMMEngine:
+         else:
+             new_ph_cache = ph_cache.copy()
+         position_ids = (
+-            torch.ones(new_ph_cache._seen_tokens, dtype=torch.long)
++            torch.ones(_safe_seq_len(new_ph_cache), dtype=torch.long)
+             .unsqueeze(0)
+             .to(self.llm.model.device)
+             * offset
+         )
+-        cos, sin = rotate_emb(new_ph_cache.key_cache[0], position_ids)
++        key_stack, value_stack = self._stack_cache_tensors(new_ph_cache)
++        cos, sin = rotate_emb(key_stack[0], position_ids)
+ 
+-        kv = torch.stack(new_ph_cache.key_cache, dim=0)
++        kv = key_stack
+         kv_rot = self.rotate_tensor(kv, cos, sin)
+-        new_ph_cache.key_cache = list(kv_rot)
++        _assign_stack_to_cache(new_ph_cache, kv_rot, value_stack)
+         return new_ph_cache
+ 
+     def fetch_shared_cache(
+         self,
+         ph_id: str,
+         message: str,
++        request_uid: Optional[str] = None,
+     ) -> Tuple[DynamicCache, Dict[str, torch.Tensor], int]:
+         """Retrieve shared KV cache and ids for a placeholder given message context."""
+-        shared_memory = self.llm._shared_kv_cache_memory
+-
+         if "user_question" in ph_id:
++            shared_memory = self.llm._shared_kv_cache_memory
+             return (
+                 shared_memory["input"][message][-1],
+                 shared_memory["input_ids"][message][-1],
+@@ -1230,6 +1330,27 @@ class KVCOMMEngine:
+         type_str, node_id, *rest = ph_id.split("_")
+         is_current = (rest and rest[0] == "current")
+ 
++        # Corrected PrimeVul handoff: the validator resolves the current code
++        # placeholder from Agent 1's opaque request package.  No plaintext code
++        # is stored in shared model memory or accepted by this path.
++        if type_str == "agent" and is_current and request_uid is not None:
++            state = self.resolve_request_state(request_uid)
++            package = state.bare_code_packages.get(node_id)
++            if package is not None:
++                package = self.llm.get_bare_code_package(
++                    request_uid=request_uid, source_agent_id=node_id
++                )
++                return (
++                    package.kv_cache,
++                    {
++                        "input_ids": package.input_ids,
++                        "attention_mask": package.attention_mask,
++                    },
++                    0,
++                )
++
++        shared_memory = self.llm._shared_kv_cache_memory
++
+         key_prefix = "condition" if type_str == "condition" else "response"
+         slot_idx = -1 if is_current else -2
+ 
+diff --git a/KVCOMM/llm/llm.py b/KVCOMM/llm/llm.py
+index 3da431b..b62a22b 100644
+--- a/KVCOMM/llm/llm.py
++++ b/KVCOMM/llm/llm.py
+@@ -14,8 +14,8 @@ class LLM(ABC):
+     implementations.
+     """
+ 
+-    DEFAULT_MAX_TOKENS = 512
+-    DEFAULT_TEMPERATURE = 1.0
++    DEFAULT_MAX_TOKENS = 6000
++    DEFAULT_TEMPERATURE = 0.3
+     DEFUALT_NUM_COMPLETIONS = 1
+     DEFAULT_BANDWIDTH = 3072
+     DEFAULT_MIN_TOKENS = OUT_LENGTH
+diff --git a/KVCOMM/prompt/__init__.py b/KVCOMM/prompt/__init__.py
+index f7cf61f..f2c7c25 100644
+--- a/KVCOMM/prompt/__init__.py
++++ b/KVCOMM/prompt/__init__.py
+@@ -3,9 +3,13 @@ from KVCOMM.prompt.mmlu_prompt_set import MMLUPromptSet
+ from KVCOMM.prompt.humaneval_prompt_set import HumanEvalPromptSet
+ from KVCOMM.prompt.gsm8k_prompt_set import GSM8KPromptSet
+ from KVCOMM.prompt.copy_machine_prompt_set import COPYpromptSet
++from KVCOMM.prompt.secure_code_prompt_set import SecureCodePromptSet
++from KVCOMM.prompt.primevul_prompt_set import PrimeVulPromptSet
+ 
+ __all__ = ['MMLUPromptSet',
+            'HumanEvalPromptSet',
+            'GSM8KPromptSet',
+            'COPYpromptSet',
++           'SecureCodePromptSet',
++           'PrimeVulPromptSet',
+            'PromptSetRegistry']
+\ No newline at end of file

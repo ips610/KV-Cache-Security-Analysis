@@ -1,0 +1,61 @@
+# MarginThresholdRun — evaluate every model at kvcomm_margin_threshold in
+# {0.1, 0.3, 0.5}, a SINGLE run per (model, threshold) with no seed iteration.
+#
+#   python experiments/sweep.py --spec experiments/sweeps/margin_threshold_run.yaml
+#
+# Preview the cells first:
+#   python experiments/sweep.py --spec experiments/sweeps/margin_threshold_run.yaml --dry-run
+#
+# 3 models x 1 mode x 3 thresholds x 1 run = 9 cells.
+#
+# --- Why three separate runs, not one pass with three post-hoc thresholds ---
+# kvcomm_margin_threshold is `kv_threshold` -> KVCommConfig.threshold, consumed
+# in KVCOMMEngine.predict_as_anchor(). It is NOT a decision applied after the
+# model output: it is applied *during* the pipeline and (a) selects which
+# forward pass becomes the emitted output (KV-reuse on a hit vs dense on a
+# miss — different token sequences), and (b) mutates the online anchor pool
+# (activation counts written back drive update_anchor pruning), so task N's
+# threshold decision changes task N+1's available anchors. A captured run
+# therefore cannot be faithfully re-thresholded without recomputation, so each
+# threshold is its own run. Each cell already executes in a fresh subprocess
+# with a clean CUDA/anchor context, so there is no cross-threshold state to
+# dedup beyond what the harness already isolates.
+#
+# --- Single run, no seeds ---
+# `repetitions: 1` with no `seeds` key => the loader derives a single seed (42)
+# purely to pin determinism; there is no seed sweep and no averaging across
+# runs. Each experiment executes exactly once.
+sweep_name: MarginThresholdRun
+models:
+  - Qwen/Qwen2.5-3B-Instruct
+  - Qwen/Qwen2.5-Coder-7B-Instruct
+  - meta-llama/Llama-3.2-3B-Instruct
+modes: [kvcomm]
+repetitions: 1
+tasks_path: datasets/secure_code/coding_tasks.jsonl
+limit: null
+max_tokens: 6000
+
+# The three margin thresholds under study; every model is evaluated at each.
+# The cartesian expansion yields one cell per threshold per model.
+kv_params:
+  kv_threshold: [0.1, 0.3, 0.5]
+  kv_max_anchor_num: [20]
+  kv_window_size: [5]
+
+# Generator never uses KV reuse: the code under review is byte-identical across
+# thresholds, so any validator divergence is attributable to the margin.
+generator_dense: true
+
+# Validator behavior (legacy on-hit-baseline path in security_validator.py):
+#   anchor HIT  -> KV-reuse pass + ONE dense baseline pass (reference only)
+#   anchor MISS -> ONE dense pass only (the natural execution path)
+# dense_reference_always=false keeps the miss path to a single dense pass;
+# noise_floor_baseline=false keeps the hit path to a single dense baseline.
+dense_reference_always: false
+noise_floor_baseline: false
+
+# The 0.5 threshold clears the entropy gate most easily -> most anchor hits ->
+# most on-hit dense baselines -> the slowest cells. Generous headroom.
+cell_timeout_minutes: 2200
+output_root: results

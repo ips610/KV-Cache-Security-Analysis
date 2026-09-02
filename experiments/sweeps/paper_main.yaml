@@ -1,0 +1,33 @@
+# Main paper sweep: locally cached models (no downloads needed) — scale +
+# architecture diversity. Runs on a single H100 80GB; cells execute
+# sequentially, each in a fresh subprocess. Resume an interrupted sweep by
+# re-running:
+#   python experiments/sweep.py --spec experiments/sweeps/paper_main.yaml
+#
+# kvcomm-only: --mode baseline runs the identical allow_kv_reuse natural pass
+# as kvcomm (only the pass label differs), so it is not an independent dense
+# reference and is dropped from this sweep. The dense reference is derived
+# honestly from within the kvcomm pass itself: natural anchor-miss records
+# (natural_dense_mean_ttft) plus the per-task measurement-only on-hit dense
+# baselines, both of which are unaffected and valid. 3 models x 1 mode x
+# 1 kv-point x 3 repetitions = 9 cells total.
+sweep_name: paper_main_v1
+models:
+  - Qwen/Qwen2.5-3B-Instruct
+  - Qwen/Qwen2.5-Coder-7B-Instruct
+  - meta-llama/Llama-3.2-3B-Instruct
+modes: [kvcomm]
+repetitions: 3
+seeds: [42, 43, 44]
+tasks_path: datasets/secure_code/coding_tasks.jsonl
+limit: null
+max_tokens: 6000
+kv_params:
+  kv_threshold: [0.3]
+  kv_max_anchor_num: [20]
+  kv_window_size: [5]
+# 6000-token generations x 100 tasks x 2 agents (+ on-hit dense baselines) can
+# exceed 20h on the 7B model; give each cell generous headroom. Set `limit` to
+# a small number for smoke runs.
+cell_timeout_minutes: 1500
+output_root: results

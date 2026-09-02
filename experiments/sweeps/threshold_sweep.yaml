@@ -1,0 +1,52 @@
+# ThresholdSweep — the RQ4 speed/fidelity frontier, with a measured noise floor.
+#
+#   python experiments/sweep.py --spec experiments/sweeps/threshold_sweep.yaml
+#
+# Per prompt:
+#   generator (ALWAYS dense, never KV reuse)
+#     -> validator KV reuse attempt : every task, whatever the verdicts are
+#                                     (falls back to dense if the gate misses);
+#                                     this is the run that updates the anchor pool
+#     -> validator dense prefill    : the reference report, every task
+#
+# One dense run per task, not two. The noise floor still gets measured, just for
+# free: because the validator samples, each repetition produces an independent
+# dense report for the same task, so comparing dense across repetitions IS the
+# dense-vs-dense measurement. A second dense run inside a cell would have bought
+# the same number at roughly a third more GPU time.
+#
+# Sampling is confined to the validator. The generator is greedy AND dense, so
+# the code under review is byte-identical across every threshold, repetition and
+# arm -- the paper's central confound control -- while the validator's
+# repetitions genuinely differ.
+#
+# 3 models x 3 thresholds x 3 repetitions = 27 cells.
+sweep_name: ThresholdSweep
+models:
+  - Qwen/Qwen2.5-3B-Instruct
+  - Qwen/Qwen2.5-Coder-7B-Instruct
+  - meta-llama/Llama-3.2-3B-Instruct
+modes: [kvcomm]
+repetitions: 3
+seeds: [42, 43, 44]
+tasks_path: datasets/secure_code/coding_tasks.jsonl
+limit: null
+max_tokens: 6000
+
+# The RQ4 frontier. A higher threshold clears the entropy gate more easily, so
+# it yields more anchor hits -- and, with the reference runs above, more work per
+# cell. Expect the 0.5 cells to be the slowest.
+kv_params:
+  kv_threshold: [0.1, 0.3, 0.5]
+  kv_max_anchor_num: [20]
+  kv_window_size: [5]
+
+generator_dense: true
+dense_reference_always: true
+# Off: the noise floor comes from comparing dense across repetitions instead.
+noise_floor_baseline: false
+sample_roles: "Security Validator"
+sample_temperature: 0.7
+
+cell_timeout_minutes: 2200
+output_root: results

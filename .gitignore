@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+.claude/
+.superpowers/
+
+# Third-party checkouts created by the setup scripts. Neither project is
+# distributed with this repository (see external/README.md).
+external/KVCOMM/
+external/CacheBlend/
+
+# Experiment output trees: hundreds of MB of generated artifacts per sweep.
+# Sync them between machines with scp/rsync, not through this repo.
+runs/
+result/
+results/
+dense_validation_results/
+dense_kvcomm_comparison/
+logs/
+# Staged report summaries written by experiments/collect_reports.py.
+docs/experiment_reports/
+# Any sweep tree pasted at the repo root: these hold Latency.json plus per-task
+# reports. Match by content, not by name, so a tree dropped under a new name is
+# still excluded.
+**/report_discrepancy_summary.json
+**/manifest.json
+# Archives of the trees above.
+*.zip
+
+# PrimeVul source dumps: 62 MB, re-downloadable and sha256-pinned in
+# datasets/primevul/manifest.json. The derived sample IS tracked.
+datasets/primevul/raw/
+# ...but the dataset build manifest is provenance, not run state.
+!datasets/primevul/manifest.json
