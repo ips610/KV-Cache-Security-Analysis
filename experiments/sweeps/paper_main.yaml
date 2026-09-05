@@ -26,7 +26,7 @@ kv_params:
   kv_threshold: [0.3]
   kv_max_anchor_num: [20]
   kv_window_size: [5]
-# 6000-token generations x 100 tasks x 2 agents (+ on-hit dense baselines) can
+# 6000-token generations x 90 tasks x 2 agents (+ on-hit dense baselines) can
 # exceed 20h on the 7B model; give each cell generous headroom. Set `limit` to
 # a small number for smoke runs.
 cell_timeout_minutes: 1500

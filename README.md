@@ -90,9 +90,9 @@ python -m pytest tests -q                              # CPU test suite (about 3
 `setup_kvcomm.sh` is idempotent, verifies the checkout by tree hash and
 sha256, refuses to touch a checkout with unexpected local changes, and accepts
 `--reset` to re-apply. Point `KVCOMM_ROOT` at an existing checkout to install
-elsewhere. Expected test result: 238 passed, 2 skipped, and 2 failures in
-`tests/secure_code/test_dataset.py` that predate this release (they assert the
-task file holds 100 tasks; it holds the 90 VIBE tasks used in the paper).
+elsewhere. Expected test result: all tests pass, with the GPU tests skipped.
+On Windows, clone into a short path or set `git config core.longpaths true`;
+the deepest path in the repository is about 130 characters.
 
 ### 3.2 CacheBlend arm
 

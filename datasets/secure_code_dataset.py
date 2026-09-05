@@ -1,8 +1,9 @@
-"""Loader for the secure-code task set (100 diverse coding tasks).
+"""Loader for the secure-code task set (90 diverse app-building tasks).
 
-The dataset (``secure_code/coding_tasks.jsonl``) combines the 10 original
-authentication tasks with 90 app-building tasks sampled from MiniMaxAI/VIBE;
-it is regenerated with ``datasets/secure_code/build_tasks.py``.
+The dataset (``secure_code/coding_tasks.jsonl``) holds 90 tasks sampled from
+MiniMaxAI/VIBE, stratified over domain x difficulty; it is regenerated
+byte-identically with ``datasets/secure_code/build_tasks.py``. The ten
+authentication tasks in ``auth_tasks.jsonl`` are kept for reference only.
 """
 from __future__ import annotations
 

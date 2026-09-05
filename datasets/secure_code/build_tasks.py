@@ -1,18 +1,22 @@
-"""Build the 100-task secure-code dataset (coding_tasks.jsonl).
+"""Build the 90-task secure-code corpus (coding_tasks.jsonl).
 
-Combines the 10 original authentication tasks (auth_tasks.jsonl) with 90
-diverse app-building tasks sampled deterministically from the MiniMaxAI/VIBE
-dataset (200 curated full-stack prompts, MIT license). See
-docs/TASK_SOURCES.md for the full source survey.
+Samples 90 diverse app-building tasks deterministically from the MiniMaxAI/VIBE
+dataset (200 curated full-stack prompts, MIT license). See docs/TASK_SOURCES.md
+for the full source survey.
 
 The sample is stratified over the 5x3 domain x difficulty grid (6 tasks per
 stratum) using a fixed seed, so reruns produce byte-identical output. The
 generated coding_tasks.jsonl is committed to the repo; runs never need
 network access.
 
+The ten authentication tasks from early development (auth_tasks.jsonl) are not
+part of the corpus the paper reports; ``--include-auth`` prepends them, which
+reproduces the 100-task file used before the reported runs.
+
 Usage:
     python datasets/secure_code/build_tasks.py
     python datasets/secure_code/build_tasks.py --vibe-path <local vibe_queries.jsonl>
+    python datasets/secure_code/build_tasks.py --include-auth
 """
 from __future__ import annotations
 
@@ -73,13 +77,20 @@ def main() -> None:
         default=None,
         help="Local vibe_queries.jsonl to use instead of downloading",
     )
+    parser.add_argument(
+        "--include-auth",
+        action="store_true",
+        help="Prepend the 10 authentication tasks (auth_tasks.jsonl); not used by the paper",
+    )
     args = parser.parse_args()
 
-    auth_tasks = read_jsonl(AUTH_TASKS_PATH.read_text(encoding="utf-8"))
     vibe_rows = fetch_vibe(args.vibe_path)
     sampled = sample_vibe(vibe_rows, VIBE_SAMPLE_SIZE, SEED)
 
-    records = [{"task": t["task"], "source": "auth"} for t in auth_tasks]
+    records: list[dict] = []
+    if args.include_auth:
+        auth_tasks = read_jsonl(AUTH_TASKS_PATH.read_text(encoding="utf-8"))
+        records += [{"task": t["task"], "source": "auth"} for t in auth_tasks]
     records += [
         {
             "task": row["query"],

@@ -40,7 +40,7 @@ kv_params:
 # weaker without it.
 noise_floor_baseline: true
 
-# 6000-token generations x 100 tasks x 2 agents, plus on-hit dense baselines and
+# 6000-token generations x 90 tasks x 2 agents, plus on-hit dense baselines and
 # the second noise-floor baseline. Generous headroom per cell.
 cell_timeout_minutes: 2200
 output_root: results
