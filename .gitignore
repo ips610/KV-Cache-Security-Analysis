@@ -36,3 +36,8 @@ docs/experiment_reports/
 datasets/primevul/raw/
 # ...but the dataset build manifest is provenance, not run state.
 !datasets/primevul/manifest.json
+
+# The recorded runs the paper reports are committed under paper_results/;
+# the content-based rules above must not swallow their manifests.
+!paper_results/**/manifest.json
+!paper_results/**/report_discrepancy_summary.json
