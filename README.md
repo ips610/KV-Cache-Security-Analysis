@@ -55,8 +55,8 @@ for why).
 
 **Hardware.** All GPU experiments were run on a single NVIDIA H100 80 GB. Any
 CUDA GPU with enough memory for a 7B model in bf16 plus a 6000-token generation
-works; a 24 GB card suffices for the two 3B models. The offline analysis and the
-CPU test suite need no GPU.
+works; a 24 GB card suffices for the two 3B models. The offline analysis needs
+no GPU.
 
 **Software.** Python 3.10 for the KVCOMM arm (`requirements.txt` pins the
 versions the paper used: torch 2.1.0, transformers 4.50.2). The CacheBlend arm
@@ -84,14 +84,12 @@ see section 7):
 python -m venv .venv && source .venv/bin/activate      # or: conda create -n kvfid python=3.10
 pip install -r requirements.txt
 bash kvcomm_patch/setup_kvcomm.sh                      # clone, pin, patch, overlay, import check
-python -m pytest tests -q                              # CPU test suite (about 30 s)
 ```
 
 `setup_kvcomm.sh` is idempotent, verifies the checkout by tree hash and
 sha256, refuses to touch a checkout with unexpected local changes, and accepts
 `--reset` to re-apply. Point `KVCOMM_ROOT` at an existing checkout to install
-elsewhere. Expected test result: all tests pass, with the GPU tests skipped.
-On Windows, clone into a short path or set `git config core.longpaths true`;
+elsewhere. On Windows, clone into a short path or set `git config core.longpaths true`;
 the deepest path in the repository is about 130 characters.
 
 ### 3.2 CacheBlend arm
@@ -218,10 +216,9 @@ self-contained, for three reasons the guidelines ask us to state:
 | `datasets/` | Task corpora, builders and loaders (`secure_code/`, `primevul/`), frozen validator inputs and exported prompt token specs |
 | `generatedCodebases/` | Agent 1 outputs for the 90 VIBE tasks, per model |
 | `paper_results/` | Summaries of the runs the paper reports: timing records, metrics, environment snapshots and report tables/figures per run |
-| `tests/` | CPU test suite; GPU integration tests are opt-in via `KVCOMM_RUN_GPU_TESTS=1` |
 | `docs/` | The documents listed at the top of this file |
 | `run_generated_codebase_validation.py` | Stand-alone dense replay of the validator with plain Transformers, independent of KVCOMM, used as a cross-check |
-| `repo_paths.py`, `conftest.py`, `pytest.ini` | Path bootstrap shared by every entry point and the test configuration |
+| `repo_paths.py` | Path bootstrap shared by every entry point; reads `KVCOMM_ROOT` / `CACHEBLEND_ROOT` |
 | `external/` | Placeholder for the two third-party checkouts (contents gitignored) |
 
 `results/`, `runs/`, `logs/` and `docs/experiment_reports/` are output
