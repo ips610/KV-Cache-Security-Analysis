@@ -33,7 +33,7 @@ python experiments/sweep.py --spec experiments/sweeps/primevul_patched.yaml --ru
 
 Interrupted sweeps resume with the same command. Results land in `results/<sweep>/`.
 
-## 4. Export validator token sequences (needed by steps 5 and 7)
+## 4. Export validator token sequences (needed by step 5)
 
 ```bash
 python experiments/export_frozen_inputs.py --sweep-root results/MarginThresholdRun --canonical-kv kv_t0.3_a20_w5
@@ -65,13 +65,6 @@ python experiments/build_primevul_report.py
 ```
 
 Outputs: `results/<sweep>/report/` (Markdown, CSV, LaTeX, PDF figures).
-
-## 7. Optional: dense cross-check with plain Transformers
-
-```bash
-python run_generated_codebase_validation.py dense   --codebase-root <folder of task folders> --prompt-spec-dir datasets/secure_code/validator_prompt_spec
-python run_generated_codebase_validation.py compare --kvcomm-results results/MarginThresholdRun
-```
 
 Every script documents its options with `--help`. See `kvcomm_patch/README.md` and `cacheblend/README.md` for what the patches change.
 License: MIT (`LICENSE`); upstream KVCOMM and CacheBlend under their own terms.
