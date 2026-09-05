@@ -88,7 +88,7 @@ moves per-hit fidelity at constant coverage. Compare on measured TTFT and on
 
 ## Where CacheBlend lives
 
-CacheBlend itself is **not** in this repository (see `external/README.md`).
+CacheBlend itself is **not** in this repository (see the top-level `README.md`).
 `setup_cacheblend.sh` clones the authors' fork at a pinned commit into
 `external/CacheBlend` (override with `CACHEBLEND_ROOT` or the first argument) and
 builds it in its own conda env. The sweep scripts locate this harness via

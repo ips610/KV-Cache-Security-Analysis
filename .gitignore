@@ -21,8 +21,6 @@ results/
 dense_validation_results/
 dense_kvcomm_comparison/
 logs/
-# Staged report summaries written by experiments/collect_reports.py.
-docs/experiment_reports/
 # Any sweep tree pasted at the repo root: these hold Latency.json plus per-task
 # reports. Match by content, not by name, so a tree dropped under a new name is
 # still excluded.
@@ -31,13 +29,13 @@ docs/experiment_reports/
 # Archives of the trees above.
 *.zip
 
-# PrimeVul source dumps: 62 MB, re-downloadable and sha256-pinned in
-# datasets/primevul/manifest.json. The derived sample IS tracked.
+# Datasets are not distributed; the build scripts regenerate them. Keep every
+# built or exported data file out of the repo.
 datasets/primevul/raw/
-# ...but the dataset build manifest is provenance, not run state.
-!datasets/primevul/manifest.json
+datasets/**/*.jsonl
+datasets/**/manifest.json
+datasets/**/validator_prompt_spec/
+datasets/**/frozen_validator_inputs/
 
-# The recorded runs the paper reports are committed under paper_results/;
-# the content-based rules above must not swallow their manifests.
-!paper_results/**/manifest.json
-!paper_results/**/report_discrepancy_summary.json
+# Staged report summaries written by experiments/collect_reports.py.
+docs/experiment_reports/

@@ -24,7 +24,7 @@ On Windows run it under Git Bash or WSL.
 |---|---|
 | `KVCOMM/agents/__init__.py` | Registers the four harness agents (`CodeGenerator`, `CodeProvider`, `SecurityValidator`, `CweValidator`). |
 | `KVCOMM/prompt/__init__.py` | Registers `SecureCodePromptSet` and `PrimeVulPromptSet`. |
-| `KVCOMM/llm/llm.py` | Generation defaults used by every run: `DEFAULT_MAX_TOKENS` 512 -> 6000, `DEFAULT_TEMPERATURE` 1.0 -> 0.3 (runs use greedy decoding; see `docs/PROMPTS.md`). |
+| `KVCOMM/llm/llm.py` | Generation defaults used by every run: `DEFAULT_MAX_TOKENS` 512 -> 6000, `DEFAULT_TEMPERATURE` 1.0 -> 0.3 (runs use greedy decoding). |
 | `KVCOMM/llm/gpt_chat.py` | Measurement-only dense pass on anchor hits (the paired dense reference that cannot write to the anchor pool), per-generation TTFT / total-latency records, `[ANCHOR CREATED]` / `[ANCHOR USED]` / `[GEN:<mode>]` observability lines, the forced-response "bare code" handoff used by the PrimeVul `CodeProvider`, and sampling controls read from `KVCOMM_SAMPLE_ROLES` / `KVCOMM_SAMPLE_TEMPERATURE`. |
 | `KVCOMM/llm/kvcomm_engine.py` | `BareCodeKVPackage` (opaque KV handoff between provider and validator), anchor-pool write suppression for measurement-only passes, anchor provenance (which agent created / consumed an anchor), and the anchor logging hooks. |
 
@@ -42,7 +42,7 @@ the engine are not changed.
 | `prompt/secure_code_common.py`, `prompt/secure_code_prompt_set.py` | Prompts, rule catalogue and prompt-structure guards for the VIBE arm. |
 | `prompt/primevul_common.py`, `prompt/primevul_prompt_set.py` | The same for the PrimeVul arm. |
 
-The exact prompt text is documented in `docs/PROMPTS.md`.
+The exact prompt text lives in the four `prompt/*.py` overlay files.
 
 ## Regenerating the patch
 

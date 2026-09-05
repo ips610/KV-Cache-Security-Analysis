@@ -13,7 +13,7 @@
 #
 #   install_dir  default: $CACHEBLEND_ROOT if set, else <repo>/external/CacheBlend
 #                (gitignored; CacheBlend is not distributed with this repository,
-#                see external/README.md)
+#                see the top-level README.md)
 #   env_name     conda env to create/use (default: cacheblend)
 #
 # The fork is pinned to CACHEBLEND_SHA. The runs reported in the paper used the

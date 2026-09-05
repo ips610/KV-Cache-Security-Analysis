@@ -10,8 +10,8 @@ of ``sys.path``:
 * ``KVCOMM_ROOT``, the upstream KVCOMM checkout that ``kvcomm_patch/setup_kvcomm.sh``
   creates (default ``external/KVCOMM``), so ``import KVCOMM`` works.
 
-Neither KVCOMM nor CacheBlend is distributed with this repository; see
-``external/README.md``.
+Neither KVCOMM nor CacheBlend is distributed with this repository; see the
+top-level ``README.md``.
 """
 from __future__ import annotations
 

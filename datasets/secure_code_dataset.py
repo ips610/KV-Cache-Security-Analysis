@@ -2,8 +2,7 @@
 
 The dataset (``secure_code/coding_tasks.jsonl``) holds 90 tasks sampled from
 MiniMaxAI/VIBE, stratified over domain x difficulty; it is regenerated
-byte-identically with ``datasets/secure_code/build_tasks.py``. The ten
-authentication tasks in ``auth_tasks.jsonl`` are kept for reference only.
+byte-identically with ``datasets/secure_code/build_tasks.py``.
 """
 from __future__ import annotations
 

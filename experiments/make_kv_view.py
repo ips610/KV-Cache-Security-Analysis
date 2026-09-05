@@ -10,7 +10,7 @@ counted as run-to-run irreproducibility.
 That is what happened to ``results/MarginThresholdRun``: 533 paired folders
 became "205 unique cases" at 72.2% reproducibility, and the pooled fidelity
 numbers in its ``report/paper_metrics.md`` describe no configuration that was
-actually run. ``docs/methodology.tex`` flags this; nothing fixed it.
+actually run. The paper's methodology section flags this; nothing fixed it.
 
 This builds a view containing exactly one kv point, so the existing analysis
 runs **unmodified** and its grouping assumption (reps of one configuration)
